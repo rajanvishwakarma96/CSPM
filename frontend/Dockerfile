@@ -5,4 +5,4 @@ RUN npm install
 COPY app ./app
 COPY next.config.mjs .
 RUN npm run build
-CMD ["npm", "start"]
+CMD ["npm","start"]

@@ -1,26 +1,22 @@
-# AWS Cloud Autopilot MVP
+# Cloud Autopilot V2
 
-Runnable starter for:
-- AWS account connection using Role ARN + External ID
-- EC2/S3/RDS/ECS/EBS discovery
-- Deterministic security checks
-- Basic cost/waste recommendations
-- AI explanations
-- Safe remediation planning (execution intentionally disabled)
+Real AWS discovery + Prowler integration + AWS Cost Explorer + guarded remediation.
 
-## Run
-
+Run:
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Open http://localhost:3000 and API docs at http://localhost:8000/docs.
+Open http://localhost:3000 and http://localhost:8000/docs.
 
-DEMO_MODE=true is enabled by default so the app works without AWS credentials.
-For real AWS discovery, set DEMO_MODE=false and provide a customer cross-account
-IAM role ARN and External ID.
+DEMO mode is removed: this version expects a real cross-account IAM role.
 
-This is an MVP scaffold, not production-ready security software. Add tenant
-isolation, encryption, audit controls, least-privilege review, approval workflows,
-secret management and security testing before handling real customer accounts.
+Safety:
+- Remediation is disabled by default.
+- Set ENABLE_REMEDIATION=true only after reviewing the IAM policy.
+- Every execution requires approved=true.
+- Only S3_BLOCK_PUBLIC_ACCESS and EBS_DELETE_UNATTACHED are allow-listed.
+- EBS deletion snapshots the volume first.
+- This is an MVP; add authentication, tenant isolation, immutable audit,
+  approval policies, rollback/verification and production security controls.

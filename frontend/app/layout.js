@@ -1,10 +1,3 @@
 import "./globals.css";
-
-export const metadata = {
-  title: "AWS Cloud Autopilot",
-  description: "AWS security, cost and AI operations MVP"
-};
-
-export default function RootLayout({ children }) {
-  return <html><body>{children}</body></html>;
-}
+export const metadata={title:"Cloud Autopilot V2"};
+export default function Layout({children}){return <html><body>{children}</body></html>}

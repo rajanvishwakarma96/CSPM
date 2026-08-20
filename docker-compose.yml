@@ -5,8 +5,7 @@ services:
       POSTGRES_DB: autopilot
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+    volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d autopilot"]
       interval: 5s
@@ -18,20 +17,19 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/autopilot
+    volumes: [prowler-data:/tmp/prowler]
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "8000:8000"
+    ports: ["8000:8000"]
 
   frontend:
     build: ./frontend
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
-    depends_on:
-      - backend
-    ports:
-      - "3000:3000"
+    depends_on: [backend]
+    ports: ["3000:3000"]
 
 volumes:
   pgdata:
+  prowler-data:

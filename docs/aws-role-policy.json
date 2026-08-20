@@ -1,0 +1,20 @@
+{
+  "note": "Replace the trust principal with your SaaS worker role/account and require ExternalId.",
+  "permissions": {
+    "Version":"2012-10-17",
+    "Statement":[
+      {"Effect":"Allow","Action":[
+        "ec2:Describe*","rds:Describe*","ecs:List*","ecs:Describe*",
+        "lambda:List*","lambda:Get*","s3:ListAllMyBuckets","s3:GetBucketLocation",
+        "s3:GetPublicAccessBlock","iam:GetAccountSummary","sts:GetCallerIdentity"
+      ],"Resource":"*"},
+      {"Effect":"Allow","Action":[
+        "ce:GetCostAndUsage","ce:GetCostForecast","ce:GetCostCategories"
+      ],"Resource":"*"},
+      {"Effect":"Allow","Action":[
+        "s3:PutPublicAccessBlock","ec2:CreateSnapshot",
+        "ec2:DeleteVolume","ec2:DescribeVolumes"
+      ],"Resource":"*"}
+    ]
+  }
+}
