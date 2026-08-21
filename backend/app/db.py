@@ -30,5 +30,12 @@ def init_db():
         action TEXT NOT NULL, resource_id TEXT, approved INTEGER NOT NULL DEFAULT 0,
         executed INTEGER NOT NULL DEFAULT 0, result TEXT, created_at TEXT NOT NULL,
         executed_at TEXT)"""))
+        c.execute(text("""CREATE TABLE IF NOT EXISTS recommendations(
+        id TEXT PRIMARY KEY, account_id TEXT NOT NULL, resource_type TEXT NOT NULL,
+        resource_id TEXT NOT NULL, name TEXT, monthly_savings REAL NOT NULL,
+        basis TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)"""))
+        c.execute(text("""CREATE TABLE IF NOT EXISTS audit_events(
+        id TEXT PRIMARY KEY, account_id TEXT, actor TEXT, action TEXT,
+        resource_id TEXT, status TEXT, details TEXT, created_at TEXT)"""))
 
 init_db()
