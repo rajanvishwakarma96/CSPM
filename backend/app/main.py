@@ -1,497 +1,174 @@
+import os, uuid, datetime, json, subprocess, shutil
+from pathlib import Path
+from typing import Optional
+import boto3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
-import boto3, datetime, uuid, subprocess, os, json, shutil
+from sqlalchemy import create_engine, String, DateTime, Float, Text, JSON, ForeignKey, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-app=FastAPI(title="Cloud Autopilot",version="2.4.0")
-app.add_middleware(CORSMiddleware,allow_origins=["http://localhost:3000","http://127.0.0.1:3000","http://frontend:3000"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
-
-ACCOUNTS={}
-DATA={}
-REMEDIATION_JOBS={}
-APPROVALS={}
-
-class Account(BaseModel):
-    id: Optional[str]=None
-    account_name:str
-    account_id:str
-    role_arn:str
-    external_id:Optional[str]=None
-    regions:list[str]=Field(default_factory=lambda:["us-east-1"])
-
-def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
-def ensure(aid):
-    if aid not in ACCOUNTS: raise HTTPException(404,"AWS account not found")
-    return ACCOUNTS[aid]
-def data(aid):
-    return DATA.setdefault(aid,{"resources":[],"findings":[],"costs":[],"cost_summary":{},"recommendations":[],"errors":{},"last_sync":None})
-
-def session(a,region=None):
-    region=region or a["regions"][0]
-    sts=boto3.client("sts",region_name=region)
-    p={"RoleArn":a["role_arn"],"RoleSessionName":"CloudAutopilotV23"}
-    if a.get("external_id"): p["ExternalId"]=a["external_id"]
-    c=sts.assume_role(**p)["Credentials"]
-    return boto3.Session(aws_access_key_id=c["AccessKeyId"],aws_secret_access_key=c["SecretAccessKey"],aws_session_token=c["SessionToken"],region_name=region)
-
-@app.get("/")
-def root(): return {"service":"Cloud Autopilot","version":"2.4.0","status":"running","docs":"/docs"}
-@app.get("/health")
-def health(): return {"status":"ok","version":"2.3.0","timestamp":now()}
-@app.get("/version")
-def version():
-    return {
-        "version": "2.4.0",
-        "features": [
-            "AWS discovery",
-            "Cost Explorer",
-            "FinOps dashboard",
-            "service cost breakdown",
-            "daily cost trend",
-            "savings recommendations",
-            "Prowler security integration",
-            "AI-style finding explanations",
-            "approval-based remediation",
-            "dry-run remediation preview",
-            "AWS Organizations discovery",
-            "audit-ready remediation jobs",
-        ],
-    }
-
-@app.get("/accounts")
-def accounts(): return list(ACCOUNTS.values())
-@app.post("/accounts")
-def create(a:Account):
-    aid=a.id or str(uuid.uuid4()); x=a.model_dump(); x["id"]=aid; ACCOUNTS[aid]=x; data(aid); return x
-@app.get("/accounts/{aid}")
-def get_account(aid): return ensure(aid)
-@app.delete("/accounts/{aid}")
-def delete_account(aid):
-    ensure(aid); del ACCOUNTS[aid]; DATA.pop(aid,None); return {"status":"deleted","account_id":aid}
-
-@app.post("/accounts/{aid}/discover")
+VERSION='2.5.0'
+DB=os.getenv('DATABASE_URL','postgresql+psycopg://cloud:cloud@postgres:5432/cloud_autopilot')
+engine=create_engine(DB,pool_pre_ping=True)
+Session=sessionmaker(bind=engine,autoflush=False,autocommit=False)
+class Base(DeclarativeBase): pass
+class CloudAccount(Base):
+ __tablename__='cloud_accounts'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_name:Mapped[str]=mapped_column(String(200)); account_id:Mapped[str]=mapped_column(String(32),index=True); role_arn:Mapped[str]=mapped_column(String(500)); external_id:Mapped[Optional[str]]=mapped_column(String(300),nullable=True); regions:Mapped[list]=mapped_column(JSON,default=list); status:Mapped[str]=mapped_column(String(30),default='ACTIVE'); created_at:Mapped[datetime.datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.datetime.now(datetime.timezone.utc))
+class Resource(Base):
+ __tablename__='resources'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[str]=mapped_column(String(36),ForeignKey('cloud_accounts.id'),index=True); resource_type:Mapped[str]=mapped_column(String(80)); resource_id:Mapped[str]=mapped_column(String(500),index=True); name:Mapped[Optional[str]]=mapped_column(String(300),nullable=True); region:Mapped[str]=mapped_column(String(80)); metadata_json:Mapped[dict]=mapped_column('metadata',JSON,default=dict); last_seen_at:Mapped[datetime.datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.datetime.now(datetime.timezone.utc))
+class SecurityFinding(Base):
+ __tablename__='security_findings'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[str]=mapped_column(String(36),ForeignKey('cloud_accounts.id'),index=True); provider:Mapped[str]=mapped_column(String(50),default='prowler'); check_id:Mapped[Optional[str]]=mapped_column(String(300),nullable=True); severity:Mapped[str]=mapped_column(String(30)); title:Mapped[str]=mapped_column(String(500)); description:Mapped[Optional[str]]=mapped_column(Text,nullable=True); resource_id:Mapped[Optional[str]]=mapped_column(String(500),nullable=True); status:Mapped[str]=mapped_column(String(30),default='OPEN'); raw:Mapped[dict]=mapped_column(JSON,default=dict); created_at:Mapped[datetime.datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.datetime.now(datetime.timezone.utc))
+class CostDaily(Base):
+ __tablename__='cost_daily'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[str]=mapped_column(String(36),ForeignKey('cloud_accounts.id'),index=True); date:Mapped[str]=mapped_column(String(20),index=True); service:Mapped[str]=mapped_column(String(300)); amount:Mapped[float]=mapped_column(Float); currency:Mapped[str]=mapped_column(String(10),default='USD')
+class Recommendation(Base):
+ __tablename__='recommendations'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[str]=mapped_column(String(36),ForeignKey('cloud_accounts.id'),index=True); category:Mapped[str]=mapped_column(String(100)); title:Mapped[str]=mapped_column(String(500)); resource_id:Mapped[Optional[str]]=mapped_column(String(500),nullable=True); monthly_savings:Mapped[float]=mapped_column(Float,default=0); status:Mapped[str]=mapped_column(String(30),default='OPEN')
+class RemediationJob(Base):
+ __tablename__='remediation_jobs'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[str]=mapped_column(String(36),ForeignKey('cloud_accounts.id'),index=True); action:Mapped[str]=mapped_column(String(100)); resource_id:Mapped[Optional[str]]=mapped_column(String(500),nullable=True); reason:Mapped[Optional[str]]=mapped_column(Text,nullable=True); status:Mapped[str]=mapped_column(String(40),default='PENDING_APPROVAL'); requested_by:Mapped[str]=mapped_column(String(200),default='operator'); approved_by:Mapped[Optional[str]]=mapped_column(String(200),nullable=True); created_at:Mapped[datetime.datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.datetime.now(datetime.timezone.utc)); approved_at:Mapped[Optional[datetime.datetime]]=mapped_column(DateTime(timezone=True),nullable=True); executed_at:Mapped[Optional[datetime.datetime]]=mapped_column(DateTime(timezone=True),nullable=True); result:Mapped[dict]=mapped_column(JSON,default=dict)
+class AuditLog(Base):
+ __tablename__='audit_logs'; id:Mapped[str]=mapped_column(String(36),primary_key=True); account_id:Mapped[Optional[str]]=mapped_column(String(36),nullable=True,index=True); action:Mapped[str]=mapped_column(String(200)); actor:Mapped[str]=mapped_column(String(200),default='system'); details:Mapped[dict]=mapped_column(JSON,default=dict); created_at:Mapped[datetime.datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.datetime.now(datetime.timezone.utc))
+Base.metadata.create_all(engine)
+app=FastAPI(title='Cloud Autopilot',version=VERSION)
+app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+def now():return datetime.datetime.now(datetime.timezone.utc)
+def sid():return str(uuid.uuid4())
+def account(db,aid):
+ a=db.get(CloudAccount,aid)
+ if not a:raise HTTPException(404,'AWS account not found')
+ return a
+def aws(a,region=None):
+ region=region or (a.regions or ['us-east-1'])[0]; sts=boto3.client('sts',region_name=region); p={'RoleArn':a.role_arn,'RoleSessionName':'CloudAutopilotV25'}
+ if a.external_id:p['ExternalId']=a.external_id
+ c=sts.assume_role(**p)['Credentials']; return boto3.Session(aws_access_key_id=c['AccessKeyId'],aws_secret_access_key=c['SecretAccessKey'],aws_session_token=c['SessionToken'],region_name=region)
+def audit(db,aid,action,details={},actor='system'):db.add(AuditLog(id=sid(),account_id=aid,action=action,actor=actor,details=details));db.commit()
+class AccountIn(BaseModel): account_name:str; account_id:str; role_arn:str; external_id:Optional[str]=None; regions:list[str]=Field(default_factory=lambda:['us-east-1'])
+class RemediationIn(BaseModel): action:str; resource_id:Optional[str]=None; reason:Optional[str]=None; dry_run:bool=True
+@app.get('/')
+def root():return {'service':'Cloud Autopilot','version':VERSION,'status':'running','database':'postgresql','queue':'redis/celery'}
+@app.get('/health')
+def health():
+ db=Session();
+ try:db.execute(text('SELECT 1'));return {'status':'ok','version':VERSION,'postgres':'ok','timestamp':now().isoformat()}
+ finally:db.close()
+@app.get('/version')
+def version():return {'version':VERSION,'features':['PostgreSQL persistence','Redis/Celery foundation','AWS discovery','Cost Explorer','FinOps','Prowler','AI explanations','approval remediation','audit logs','multi-account foundation']}
+@app.get('/accounts')
+def accounts():
+ db=Session();
+ try:return [{'id':a.id,'account_name':a.account_name,'account_id':a.account_id,'role_arn':a.role_arn,'regions':a.regions,'status':a.status} for a in db.query(CloudAccount).all()]
+ finally:db.close()
+@app.post('/accounts')
+def create(x:AccountIn):
+ db=Session();a=CloudAccount(id=sid(),**x.model_dump());db.add(a);db.commit();db.refresh(a);audit(db,a.id,'ACCOUNT_CREATED',{'aws_account_id':a.account_id});return {'id':a.id,'account_name':a.account_name,'account_id':a.account_id,'role_arn':a.role_arn,'regions':a.regions}
+@app.delete('/accounts/{aid}')
+def delete(aid):
+ db=Session();account(db,aid);db.query(Resource).filter_by(account_id=aid).delete();db.query(SecurityFinding).filter_by(account_id=aid).delete();db.query(CostDaily).filter_by(account_id=aid).delete();db.query(Recommendation).filter_by(account_id=aid).delete();db.query(RemediationJob).filter_by(account_id=aid).delete();db.query(AuditLog).filter_by(account_id=aid).delete();db.query(CloudAccount).filter_by(id=aid).delete();db.commit();return {'status':'deleted','account_id':aid}
+@app.post('/accounts/{aid}/discover')
 def discover(aid):
-    a=ensure(aid); d=data(aid); out=[]; errors={}
-    for region in a["regions"]:
-        try: s=session(a,region)
-        except Exception as e: errors[f"session:{region}"]=str(e); continue
-        try:
-            ec2=s.client("ec2")
-            for rr in ec2.describe_instances().get("Reservations",[]):
-                for i in rr.get("Instances",[]):
-                    out.append({"resource_type":"EC2","resource_id":i["InstanceId"],"name":i["InstanceId"],"region":region,"data":{"state":i.get("State",{}).get("Name"),"instance_type":i.get("InstanceType")}})
-            for v in ec2.describe_volumes().get("Volumes",[]):
-                out.append({"resource_type":"EBS","resource_id":v["VolumeId"],"name":v["VolumeId"],"region":region,"data":{"size_gb":v.get("Size",0),"attached":bool(v.get("Attachments")),"state":v.get("State")}})
-            for e in ec2.describe_addresses().get("Addresses",[]):
-                if not e.get("InstanceId") and not e.get("NetworkInterfaceId"):
-                    out.append({"resource_type":"ELASTIC_IP","resource_id":e.get("AllocationId") or e.get("PublicIp"),"name":e.get("PublicIp"),"region":region,"data":{}})
-        except Exception as e: errors[f"ec2:{region}"]=str(e)
-        try:
-            for db in s.client("rds").describe_db_instances().get("DBInstances",[]):
-                out.append({"resource_type":"RDS","resource_id":db["DBInstanceIdentifier"],"name":db["DBInstanceIdentifier"],"region":region,"data":{"status":db.get("DBInstanceStatus"),"engine":db.get("Engine")}})
-        except Exception as e: errors[f"rds:{region}"]=str(e)
-        try:
-            lam=s.client("lambda")
-            for page in lam.get_paginator("list_functions").paginate():
-                for f in page.get("Functions",[]): out.append({"resource_type":"LAMBDA","resource_id":f["FunctionArn"],"name":f["FunctionName"],"region":region,"data":{"runtime":f.get("Runtime")}})
-        except Exception as e: errors[f"lambda:{region}"]=str(e)
-    try:
-        for b in session(a,a["regions"][0]).client("s3").list_buckets().get("Buckets",[]):
-            out.append({"resource_type":"S3","resource_id":b["Name"],"name":b["Name"],"region":"global","data":{}})
-    except Exception as e: errors["s3"]=str(e)
-    d["resources"]=out; d["errors"].update(errors); d["last_sync"]=now()
-    return {"status":"OK","resource_count":len(out),"resources":out}
-
-@app.get("/accounts/{aid}/resources")
-def resources(aid): ensure(aid); return data(aid)["resources"]
-
-def sync_ce(aid,days=30):
-    a=ensure(aid); d=data(aid); end=datetime.date.today(); start=end-datetime.timedelta(days=days)
-    try:
-        ce=session(a,"us-east-1").client("ce",region_name="us-east-1")
-        r=ce.get_cost_and_usage(TimePeriod={"Start":start.isoformat(),"End":end.isoformat()},Granularity="DAILY",Metrics=["UnblendedCost"],GroupBy=[{"Type":"DIMENSION","Key":"SERVICE"}])
-        services={}; daily=[]
-        for x in r.get("ResultsByTime",[]):
-            total=0
-            for g in x.get("Groups",[]):
-                amount=float(g["Metrics"]["UnblendedCost"]["Amount"]); service=g["Keys"][0]
-                services[service]=services.get(service,0)+amount; total+=amount
-            daily.append({"date":x["TimePeriod"]["Start"],"amount":round(total,4)})
-        rows=[{"service":k,"amount":round(v,2),"percentage":0} for k,v in services.items()]
-        total=sum(x["amount"] for x in rows)
-        for x in rows: x["percentage"]=round(x["amount"]/total*100,2) if total else 0
-        rows.sort(key=lambda x:x["amount"],reverse=True); daily.sort(key=lambda x:x["date"])
-        d["costs"]=rows; d["cost_summary"]={"period_start":start.isoformat(),"period_end":end.isoformat(),"total":round(total,2),"average_daily":round(total/max(days,1),2),"top_service":rows[0]["service"] if rows else None,"top_service_cost":rows[0]["amount"] if rows else 0,"daily":daily,"last_sync":now()}; d["errors"].pop("costs",None)
-        return d["cost_summary"]
-    except Exception as e:
-        d["errors"]["costs"]=str(e); raise HTTPException(400,f"Cost Explorer failed: {e}")
-
-@app.post("/accounts/{aid}/costs/sync")
+ db=Session();a=account(db,aid);rows=[];errors={}
+ for region in a.regions:
+  try:s=aws(a,region)
+  except Exception as e:errors[f'session:{region}']=str(e);continue
+  try:
+   ec2=s.client('ec2')
+   for rr in ec2.describe_instances().get('Reservations',[]):
+    for i in rr.get('Instances',[]):rows.append(('EC2',i['InstanceId'],i['InstanceId'],region,{'state':i.get('State',{}).get('Name'),'instance_type':i.get('InstanceType')}))
+   for v in ec2.describe_volumes().get('Volumes',[]):rows.append(('EBS',v['VolumeId'],v['VolumeId'],region,{'size_gb':v.get('Size',0),'attached':bool(v.get('Attachments'))}))
+  except Exception as e:errors[f'ec2:{region}']=str(e)
+  try:
+   for r in s.client('rds').describe_db_instances().get('DBInstances',[]):rows.append(('RDS',r['DBInstanceIdentifier'],r['DBInstanceIdentifier'],region,{'status':r.get('DBInstanceStatus'),'engine':r.get('Engine')}))
+  except Exception as e:errors[f'rds:{region}']=str(e)
+ try:
+  for b in aws(a).client('s3').list_buckets().get('Buckets',[]):rows.append(('S3',b['Name'],b['Name'],'global',{}))
+ except Exception as e:errors['s3']=str(e)
+ db.query(Resource).filter_by(account_id=aid).delete()
+ for typ,rid,name,region,meta in rows:db.add(Resource(id=sid(),account_id=aid,resource_type=typ,resource_id=rid,name=name,region=region,metadata_json=meta,last_seen_at=now()))
+ db.commit();audit(db,aid,'DISCOVERY_COMPLETED',{'resource_count':len(rows),'errors':errors});return {'status':'OK','resource_count':len(rows),'errors':errors}
+@app.get('/accounts/{aid}/resources')
+def resources(aid):
+ db=Session();account(db,aid);return [{'resource_type':r.resource_type,'resource_id':r.resource_id,'name':r.name,'region':r.region,'data':r.metadata_json} for r in db.query(Resource).filter_by(account_id=aid).all()]
+@app.post('/accounts/{aid}/costs/sync')
 def cost_sync(aid,days:int=30):
-    if days not in (7,14,30,60,90): raise HTTPException(400,"days must be 7, 14, 30, 60 or 90")
-    return sync_ce(aid,days)
-@app.get("/accounts/{aid}/costs")
-def costs(aid): ensure(aid); return data(aid)["costs"]
-@app.get("/accounts/{aid}/finops")
-def finops(aid):
-    ensure(aid); d=data(aid); return {"summary":d["cost_summary"],"services":d["costs"],"recommendations":d["recommendations"],"errors":d["errors"]}
-
-@app.post("/accounts/{aid}/recommendations/generate")
-def recommendations(aid):
-    ensure(aid); d=data(aid); out=[]
-    for r in d["resources"]:
-        x=r["data"]
-        if r["resource_type"]=="EBS" and not x.get("attached"):
-            savings=round(float(x.get("size_gb",0))*.08,2)
-            if savings: out.append({"id":str(uuid.uuid4()),"category":"EBS","severity":"LOW","resource_type":"EBS","resource_id":r["resource_id"],"name":r["name"],"monthly_savings":savings,"title":"Delete unattached EBS volume","requires_approval":True})
-        if r["resource_type"]=="EC2" and x.get("state")=="stopped":
-            out.append({"id":str(uuid.uuid4()),"category":"EC2","severity":"MEDIUM","resource_type":"EC2","resource_id":r["resource_id"],"name":r["name"],"monthly_savings":5.0,"title":"Review stopped EC2 instance","requires_approval":True})
-        if r["resource_type"]=="ELASTIC_IP":
-            out.append({"id":str(uuid.uuid4()),"category":"NETWORK","severity":"MEDIUM","resource_type":"ELASTIC_IP","resource_id":r["resource_id"],"name":r["name"],"monthly_savings":3.65,"title":"Review unused Elastic IP","requires_approval":True})
-    d["recommendations"]=out; return out
-@app.get("/accounts/{aid}/recommendations")
-def get_recs(aid): ensure(aid); return data(aid)["recommendations"]
-
-@app.post("/accounts/{aid}/scan")
-def scan(aid):
-    ensure(aid); d=data(aid); out=[]
-    for r in d["resources"]:
-        if r["resource_type"]=="EBS" and not r["data"].get("attached"): out.append({"id":str(uuid.uuid4()),"severity":"LOW","title":"Unattached EBS volume","description":"The EBS volume is not attached to an EC2 instance.","resource_id":r["resource_id"],"recommendation":"Confirm unused, snapshot if needed, then delete."})
-        if r["resource_type"]=="EC2" and r["data"].get("state")=="stopped": out.append({"id":str(uuid.uuid4()),"severity":"MEDIUM","title":"Stopped EC2 instance","description":"A stopped instance may still incur storage costs.","resource_id":r["resource_id"],"recommendation":"Confirm whether it is still required."})
-    d["findings"]=out; return {"status":"OK","finding_count":len(out),"findings":out}
-@app.get("/accounts/{aid}/findings")
-def findings(aid): ensure(aid); return data(aid)["findings"]
-@app.get("/accounts/{aid}/findings/{fid}/explain")
-def explain(aid,fid):
-    ensure(aid); f=next((x for x in data(aid)["findings"] if x["id"]==fid),None)
-    if not f: raise HTTPException(404,"Finding not found")
-    return {"summary":f["title"],"severity":f["severity"],"business_impact":"This configuration can increase security, operational or cloud-cost risk.","recommended_fix":f["recommendation"]}
-
-@app.post("/accounts/{aid}/organization/discover")
-def org(aid):
-    a=ensure(aid)
-    try:
-        o=session(a,"us-east-1").client("organizations",region_name="us-east-1"); rows=[]
-        for p in o.get_paginator("list_accounts").paginate(): rows.extend(p.get("Accounts",[]))
-        return {"status":"OK","accounts_found":len(rows),"accounts":rows}
-    except Exception as e: raise HTTPException(400,f"Organizations discovery failed: {e}")
-
-@app.get("/remediation/catalog")
-def catalog():
-    return {"actions":[{"id":"S3_BLOCK_PUBLIC_ACCESS","risk":"LOW","requires_approval":True},{"id":"EBS_DELETE_UNATTACHED","risk":"HIGH","requires_approval":True,"creates_snapshot":True},{"id":"EC2_STOP_UNUSED","risk":"MEDIUM","requires_approval":True},{"id":"RELEASE_UNUSED_ELASTIC_IP","risk":"MEDIUM","requires_approval":True}]}
-
-
-# ---------------- V2.4 Prowler + AI + Remediation ----------------
-
-def prowler_available():
-    return shutil.which("prowler") is not None
-
-
-def run_prowler(account_id):
-    account = ensure(account_id)
-    d = data(account_id)
-
-    if not prowler_available():
-        return {
-            "status": "not_installed",
-            "message": "Prowler is not installed in the backend image.",
-            "findings": [],
-        }
-
-    out_dir = "/tmp/prowler"
-    os.makedirs(out_dir, exist_ok=True)
-    cmd = [
-        "prowler",
-        "aws",
-        "--output-directory", out_dir,
-        "--output-formats", "json-ocsf",
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=900,
-        )
-        files = list(Path(out_dir).glob("*.json"))
-        findings = []
-
-        for f in files:
-            try:
-                payload = json.loads(f.read_text())
-                rows = payload if isinstance(payload, list) else payload.get("findings", [])
-                for row in rows:
-                    findings.append({
-                        "source": "prowler",
-                        "title": row.get("finding_info", {}).get("title")
-                                 or row.get("title")
-                                 or row.get("message")
-                                 or "Prowler finding",
-                        "severity": str(
-                            row.get("severity")
-                            or row.get("finding_info", {}).get("severity")
-                            or "UNKNOWN"
-                        ).upper(),
-                        "status": row.get("status_code")
-                                 or row.get("status")
-                                 or "UNKNOWN",
-                        "resource_id": row.get("resource", {}).get("uid")
-                                       or row.get("resource_uid")
-                                       or row.get("resource_id"),
-                        "raw": row,
-                    })
-            except Exception:
-                continue
-
-        d["prowler"] = {
-            "status": "completed",
-            "return_code": result.returncode,
-            "findings_count": len(findings),
-            "stderr": result.stderr[-3000:],
-            "timestamp": now(),
-        }
-        d["prowler_findings"] = findings
-
-        return {
-            "status": "completed",
-            "findings_count": len(findings),
-            "findings": findings,
-        }
-
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Prowler scan timed out")
-    except Exception as exc:
-        raise HTTPException(500, f"Prowler execution failed: {exc}")
-
-
-@app.get("/accounts/{aid}/prowler/status")
+ if days not in (7,14,30,60,90):raise HTTPException(400,'days must be 7, 14, 30, 60 or 90')
+ db=Session();a=account(db,aid);end=datetime.date.today();start=end-datetime.timedelta(days=days)
+ try:r=aws(a,'us-east-1').client('ce',region_name='us-east-1').get_cost_and_usage(TimePeriod={'Start':start.isoformat(),'End':end.isoformat()},Granularity='DAILY',Metrics=['UnblendedCost'],GroupBy=[{'Type':'DIMENSION','Key':'SERVICE'}])
+ except Exception as e:raise HTTPException(400,f'Cost Explorer failed: {e}')
+ db.query(CostDaily).filter_by(account_id=aid).delete()
+ for day in r.get('ResultsByTime',[]):
+  for g in day.get('Groups',[]):db.add(CostDaily(id=sid(),account_id=aid,date=day['TimePeriod']['Start'],service=g['Keys'][0],amount=float(g['Metrics']['UnblendedCost']['Amount'])))
+ db.commit();audit(db,aid,'COST_SYNC_COMPLETED',{'days':days});return {'status':'OK','days':days}
+@app.get('/accounts/{aid}/costs')
+def costs(aid):
+ db=Session();account(db,aid);d={}
+ for r in db.query(CostDaily).filter_by(account_id=aid).all():d[r.service]=d.get(r.service,0)+r.amount
+ return [{'service':k,'amount':round(v,2)} for k,v in sorted(d.items(),key=lambda x:x[1],reverse=True)]
+def prowler_ok():return shutil.which('prowler') is not None
+@app.post('/accounts/{aid}/prowler/scan')
+def prowler(aid):
+ db=Session();account(db,aid)
+ if not prowler_ok():raise HTTPException(503,'Prowler is not installed')
+ out=f'/tmp/prowler-{aid}-{sid()}';os.makedirs(out,exist_ok=True)
+ try:p=subprocess.run(['prowler','aws','--output-directory',out,'--output-formats','json-ocsf'],capture_output=True,text=True,timeout=900)
+ except subprocess.TimeoutExpired:raise HTTPException(504,'Prowler scan timed out')
+ findings=[]
+ for f in Path(out).glob('*.json'):
+  try:
+   x=json.loads(f.read_text());findings.extend(x if isinstance(x,list) else x.get('findings',[]))
+  except Exception:pass
+ db.query(SecurityFinding).filter_by(account_id=aid).delete()
+ for x in findings:
+  info=x.get('finding_info',{}) or {};db.add(SecurityFinding(id=sid(),account_id=aid,provider='prowler',check_id=info.get('uid') or x.get('check_id'),severity=str(x.get('severity') or info.get('severity') or 'UNKNOWN').upper(),title=info.get('title') or x.get('title') or 'Prowler finding',description=x.get('message'),resource_id=(x.get('resource') or {}).get('uid') or x.get('resource_uid') or x.get('resource_id'),raw=x))
+ db.commit();audit(db,aid,'PROWLER_SCAN_COMPLETED',{'findings':len(findings),'return_code':p.returncode});return {'status':'completed','findings_count':len(findings)}
+@app.get('/accounts/{aid}/prowler/status')
 def prowler_status(aid):
-    ensure(aid)
-    d = data(aid)
-    return {
-        "installed": prowler_available(),
-        "last_run": d.get("prowler"),
-        "findings_count": len(d.get("prowler_findings", [])),
-    }
-
-
-@app.post("/accounts/{aid}/prowler/scan")
-def prowler_scan(aid):
-    return run_prowler(aid)
-
-
-@app.get("/accounts/{aid}/security/overview")
-def security_overview(aid):
-    ensure(aid)
-    d = data(aid)
-    findings = d.get("prowler_findings", []) + d.get("findings", [])
-
-    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
-    for f in findings:
-        sev = str(f.get("severity", "UNKNOWN")).upper()
-        if sev not in counts:
-            sev = "UNKNOWN"
-        counts[sev] += 1
-
-    return {
-        "total": len(findings),
-        "severity": counts,
-        "prowler": d.get("prowler", {}),
-    }
-
-
-@app.get("/accounts/{aid}/security/findings")
-def security_findings(aid):
-    ensure(aid)
-    d = data(aid)
-    return d.get("prowler_findings", []) + d.get("findings", [])
-
-
-@app.post("/accounts/{aid}/security/explain/{finding_index}")
-def ai_explain(aid, finding_index: int):
-    ensure(aid)
-    findings = data(aid).get("prowler_findings", []) + data(aid).get("findings", [])
-
-    if finding_index < 0 or finding_index >= len(findings):
-        raise HTTPException(404, "Finding not found")
-
-    f = findings[finding_index]
-    severity = str(f.get("severity", "UNKNOWN")).upper()
-
-    priority = {
-        "CRITICAL": 100,
-        "HIGH": 85,
-        "MEDIUM": 60,
-        "LOW": 30,
-        "UNKNOWN": 10,
-    }.get(severity, 10)
-
-    title = f.get("title", "Cloud security finding")
-    resource = f.get("resource_id")
-
-    return {
-        "finding": title,
-        "resource_id": resource,
-        "risk_score": priority,
-        "executive_summary": (
-            f"{title} should be reviewed because it may increase "
-            "security, operational, compliance, or cloud-cost risk."
-        ),
-        "why_it_matters": (
-            "Prioritize internet exposure, identity permissions, "
-            "unencrypted data, logging gaps, and high-impact resources."
-        ),
-        "recommended_action": (
-            "Validate the finding against the workload's business "
-            "requirements before applying a change."
-        ),
-        "safe_next_step": (
-            "Create an approval request and execute only after an "
-            "authorized operator reviews the proposed action."
-        ),
-    }
-
-
-class RemediationRequest(BaseModel):
-    action: str
-    resource_id: Optional[str] = None
-    reason: Optional[str] = None
-    dry_run: bool = True
-
-
-def create_job(aid, request):
-    job_id = str(uuid.uuid4())
-    job = {
-        "id": job_id,
-        "account_id": aid,
-        "action": request.action,
-        "resource_id": request.resource_id,
-        "reason": request.reason,
-        "dry_run": request.dry_run,
-        "status": "PENDING_APPROVAL",
-        "created_at": now(),
-        "approved_at": None,
-        "executed_at": None,
-        "result": None,
-    }
-    REMEDIATION_JOBS[job_id] = job
-    return job
-
-
-@app.post("/accounts/{aid}/remediation/preview")
-def remediation_preview(aid, request: RemediationRequest):
-    ensure(aid)
-
-    allowed = {
-        "EBS_DELETE_UNATTACHED",
-        "EC2_STOP_UNUSED",
-        "RELEASE_UNUSED_ELASTIC_IP",
-    }
-
-    if request.action not in allowed:
-        raise HTTPException(400, "Unsupported remediation action")
-
-    return {
-        "safe": True,
-        "requires_approval": True,
-        "action": request.action,
-        "resource_id": request.resource_id,
-        "dry_run": True,
-        "impact": "A production resource may be changed or deleted.",
-        "recommended": (
-            "Take a snapshot/back-up where appropriate and verify "
-            "the resource is not required before execution."
-        ),
-    }
-
-
-@app.post("/accounts/{aid}/remediation/request")
-def remediation_request(aid, request: RemediationRequest):
-    ensure(aid)
-
-    if not request.dry_run:
-        raise HTTPException(
-            400,
-            "Direct execution is disabled. Create an approval request first.",
-        )
-
-    return create_job(aid, request)
-
-
-@app.get("/remediation/jobs")
-def remediation_jobs():
-    return list(REMEDIATION_JOBS.values())
-
-
-@app.get("/remediation/jobs/{job_id}")
-def remediation_job(job_id):
-    job = REMEDIATION_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Remediation job not found")
-    return job
-
-
-@app.post("/remediation/jobs/{job_id}/approve")
-def approve_remediation(job_id):
-    job = REMEDIATION_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Remediation job not found")
-
-    if job["status"] != "PENDING_APPROVAL":
-        raise HTTPException(400, "Job is not awaiting approval")
-
-    job["status"] = "APPROVED"
-    job["approved_at"] = now()
-    return job
-
-
-@app.post("/remediation/jobs/{job_id}/execute")
-def execute_remediation(job_id):
-    job = REMEDIATION_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Remediation job not found")
-
-    if job["status"] != "APPROVED":
-        raise HTTPException(
-            400,
-            "Remediation must be explicitly approved before execution.",
-        )
-
-    # V2.4 intentionally keeps real destructive execution disabled.
-    # This endpoint records the execution attempt and requires a future
-    # worker with explicit IAM permissions and resource-specific safeguards.
-    job["status"] = "EXECUTION_BLOCKED_SAFE_MODE"
-    job["executed_at"] = now()
-    job["result"] = {
-        "message": (
-            "Safe mode: real AWS mutation is disabled in V2.4. "
-            "The approved job was recorded but no AWS resource was changed."
-        )
-    }
-    return job
-
-
-@app.get("/accounts/{aid}/finops/security-summary")
-def finops_security_summary(aid):
-    ensure(aid)
-    d = data(aid)
-    recs = d.get("recommendations", [])
-    findings = d.get("prowler_findings", []) + d.get("findings", [])
-    savings = sum(float(x.get("monthly_savings", 0)) for x in recs)
-
-    return {
-        "monthly_savings_estimate": round(savings, 2),
-        "security_findings": len(findings),
-        "critical_high": sum(
-            1 for x in findings
-            if str(x.get("severity", "")).upper() in ("CRITICAL", "HIGH")
-        ),
-        "cost_summary": d.get("cost_summary", {}),
-    }
-
-@app.get("/accounts/{aid}/dashboard")
+ db=Session();account(db,aid);n=db.query(SecurityFinding).filter_by(account_id=aid).count();return {'installed':prowler_ok(),'findings_count':n}
+@app.get('/accounts/{aid}/security/findings')
+def findings(aid):
+ db=Session();account(db,aid);return [{'id':f.id,'severity':f.severity,'title':f.title,'description':f.description,'resource_id':f.resource_id,'status':f.status,'check_id':f.check_id} for f in db.query(SecurityFinding).filter_by(account_id=aid).all()]
+@app.post('/accounts/{aid}/security/explain/{fid}')
+def explain(aid,fid):
+ db=Session();account(db,aid);f=db.get(SecurityFinding,fid)
+ if not f or f.account_id!=aid:raise HTTPException(404,'Finding not found')
+ return {'finding':f.title,'severity':f.severity,'risk_score':{'CRITICAL':100,'HIGH':85,'MEDIUM':60,'LOW':30}.get(f.severity,10),'executive_summary':f'{f.title} may increase security or compliance risk.','recommended_action':'Validate the finding, then use approval-based remediation.','ai_provider':'rule-based-v2.5','resource_id':f.resource_id}
+@app.post('/accounts/{aid}/recommendations/generate')
+def genrec(aid):
+ db=Session();account(db,aid);db.query(Recommendation).filter_by(account_id=aid).delete()
+ for r in db.query(Resource).filter_by(account_id=aid).all():
+  m=r.metadata_json or {}
+  if r.resource_type=='EBS' and not m.get('attached'):db.add(Recommendation(id=sid(),account_id=aid,category='EBS',title='Delete unattached EBS volume',resource_id=r.resource_id,monthly_savings=round(float(m.get('size_gb',0))*.08,2)))
+  elif r.resource_type=='EC2' and m.get('state')=='stopped':db.add(Recommendation(id=sid(),account_id=aid,category='EC2',title='Review stopped EC2 instance',resource_id=r.resource_id,monthly_savings=5))
+ db.commit();return [{'id':r.id,'title':r.title,'resource_id':r.resource_id,'monthly_savings':r.monthly_savings} for r in db.query(Recommendation).filter_by(account_id=aid).all()]
+@app.get('/accounts/{aid}/recommendations')
+def recs(aid):
+ db=Session();account(db,aid);return [{'id':r.id,'title':r.title,'resource_id':r.resource_id,'monthly_savings':r.monthly_savings,'status':r.status} for r in db.query(Recommendation).filter_by(account_id=aid).all()]
+@app.post('/accounts/{aid}/remediation/preview')
+def preview(aid,x:RemediationIn):
+ db=Session();account(db,aid);allowed={'EBS_DELETE_UNATTACHED','EC2_STOP_UNUSED','RELEASE_UNUSED_ELASTIC_IP','S3_BLOCK_PUBLIC_ACCESS'}
+ if x.action not in allowed:raise HTTPException(400,'Unsupported remediation action')
+ return {'safe':True,'requires_approval':True,'action':x.action,'resource_id':x.resource_id,'dry_run':True}
+@app.post('/accounts/{aid}/remediation/request')
+def request(aid,x:RemediationIn):
+ db=Session();account(db,aid);j=RemediationJob(id=sid(),account_id=aid,action=x.action,resource_id=x.resource_id,reason=x.reason);db.add(j);db.commit();db.refresh(j);audit(db,aid,'REMEDIATION_REQUESTED',{'job_id':j.id,'action':j.action});return {'id':j.id,'status':j.status}
+@app.get('/remediation/jobs')
+def jobs():
+ db=Session();return [{'id':j.id,'account_id':j.account_id,'action':j.action,'resource_id':j.resource_id,'status':j.status,'created_at':j.created_at.isoformat()} for j in db.query(RemediationJob).order_by(RemediationJob.created_at.desc()).all()]
+@app.post('/remediation/jobs/{jid}/approve')
+def approve(jid,actor='operator'):
+ db=Session();j=db.get(RemediationJob,jid)
+ if not j:raise HTTPException(404,'Remediation job not found')
+ if j.status!='PENDING_APPROVAL':raise HTTPException(400,'Job is not awaiting approval')
+ j.status='APPROVED';j.approved_by=actor;j.approved_at=now();db.commit();audit(db,j.account_id,'REMEDIATION_APPROVED',{'job_id':jid},actor);return {'id':jid,'status':j.status}
+@app.post('/remediation/jobs/{jid}/execute')
+def execute(jid):
+ db=Session();j=db.get(RemediationJob,jid)
+ if not j:raise HTTPException(404,'Remediation job not found')
+ if j.status!='APPROVED':raise HTTPException(400,'Job must be approved first')
+ j.status='EXECUTION_BLOCKED_SAFE_MODE';j.executed_at=now();j.result={'message':'V2.5 safe mode: no destructive AWS mutation performed.'};db.commit();audit(db,j.account_id,'REMEDIATION_EXECUTION_BLOCKED',{'job_id':jid});return {'id':jid,'status':j.status,'result':j.result}
+@app.get('/accounts/{aid}/audit')
+def audit_logs(aid):
+ db=Session();account(db,aid);return [{'id':x.id,'action':x.action,'actor':x.actor,'details':x.details,'created_at':x.created_at.isoformat()} for x in db.query(AuditLog).filter_by(account_id=aid).order_by(AuditLog.created_at.desc()).limit(200).all()]
+@app.get('/accounts/{aid}/dashboard')
 def dashboard(aid):
-    ensure(aid); d=data(aid)
-    return {"account_id":aid,"resources":d["resources"],"findings":d["findings"],"costs":d["costs"],"cost_summary":d["cost_summary"],"recommendations":d["recommendations"],"errors":d["errors"],"last_sync":d["last_sync"]}
+ db=Session();account(db,aid);rs=[{'resource_type':r.resource_type,'resource_id':r.resource_id,'name':r.name,'region':r.region,'data':r.metadata_json} for r in db.query(Resource).filter_by(account_id=aid).all()];fs=[{'id':f.id,'severity':f.severity,'title':f.title,'resource_id':f.resource_id,'status':f.status} for f in db.query(SecurityFinding).filter_by(account_id=aid).all()];rc=[{'id':r.id,'title':r.title,'resource_id':r.resource_id,'monthly_savings':r.monthly_savings} for r in db.query(Recommendation).filter_by(account_id=aid).all()];d={}
+ for c in db.query(CostDaily).filter_by(account_id=aid).all():d[c.service]=d.get(c.service,0)+c.amount
+ return {'account_id':aid,'resources':rs,'findings':fs,'recommendations':rc,'costs':[{'service':k,'amount':round(v,2)} for k,v in sorted(d.items(),key=lambda x:x[1],reverse=True)],'cost_summary':{'total':round(sum(d.values()),2)}}
